@@ -134,10 +134,23 @@ struct he_encl_remove_pages {
 
 /*
  * Isolated-VM hypercall, run from this driver so the monitor sees CPL 0.
- * `op` is one of HC_VM_* / HC_DEV_* (0x60–0x6d). `ret` is the hypercall
- * result: a positive vm id, 0, or a negative errno. Pages named by
- * `user_addr` are pinned for the life of the donation. `flags` bit 0 is
- * VM_PAGE_MEASURE; a 2MB span is rejected here (this ioctl pins 4KB).
+ * `op` is HC_DEVICE_MAP_DMA / HC_DEVICE_UNMAP_DMA (0x53/0x54) or one of
+ * HC_VM_* / HC_DEV_* (0x60–0x6d). `ret` is the hypercall result: a
+ * positive vm id, 0, or a negative errno.
+ *
+ * ADD_PAGE / ADD_SHARED: `user_addr` is one pinned 4KB page. `flags` bit 0
+ * is VM_PAGE_MEASURE. Bit 1 (VM_PAGE_2M) asks the driver to allocate one
+ * order-9 kernel block itself: `user_addr` must be 0, `gpa` must be
+ * 2MB-aligned, and the host physical address is not returned. After a
+ * successful add or remove, `digest[0]` and `digest[1]` are the bytes L1
+ * reads at the two ends of that block. A non-zero `aux` smaller than 2MB
+ * is added to the physical address before the hypercall so an unaligned
+ * donation can be rejected; that block is not kept.
+ *
+ * MAP_DMA / UNMAP_DMA: `user_addr` points at a 1560-byte DeviceDmaMapReq.
+ * `flags` bit 0 (only on these ops) fills maps[0].paddr from the page
+ * already donated at `gpa`. The physical address is not copied back.
+ *
  * After VCPU_RUN, reason/request/arg0/arg1/arg2 are ExitInfo and `aux`
  * is the exit GPA.
  *

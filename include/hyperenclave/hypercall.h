@@ -215,11 +215,13 @@
 #define HC_SET_INIT_CMRM_DONE 0x201
 
 /*
- * Protected-device list and the isolated-VM hypercalls (monitor codes
- * 0x50, 0x60–0x6d). Issued only from this driver; ring 3 reaches them
- * through HE_IOC_IVM.
+ * Protected-device list, DMA batch map/unmap, and the isolated-VM
+ * hypercalls (monitor codes 0x50, 0x53–0x54, 0x60–0x6d). Issued only
+ * from this driver; ring 3 reaches them through HE_IOC_IVM.
  */
 #define HC_DEVICE_LIST 0x50
+#define HC_DEVICE_MAP_DMA 0x53
+#define HC_DEVICE_UNMAP_DMA 0x54
 #define HC_VM_CREATE 0x60
 #define HC_VM_DESTROY 0x61
 #define HC_VM_FINALIZE 0x62

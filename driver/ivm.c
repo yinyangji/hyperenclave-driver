@@ -10,6 +10,8 @@
  * are pinned; their host physical address is what the monitor calls a PFN.
  */
 
+#include <linux/compiler.h>
+#include <linux/gfp.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -26,6 +28,14 @@
 
 #define HE_IVM_MAX_PAGES 4096
 #define HE_IVM_PAGE_MEASURE 1u
+#define HE_IVM_PAGE_2M 2u
+#define HE_IVM_PAGE_KNOWN (HE_IVM_PAGE_MEASURE | HE_IVM_PAGE_2M)
+/* MAP_DMA / UNMAP_DMA: fill maps[0].paddr from a page this fd donated. */
+#define HE_IVM_DMA_USE_GPA 1u
+#define HE_IVM_2M_ORDER 9
+#define HE_IVM_2M (PAGE_SIZE << HE_IVM_2M_ORDER)
+#define HE_IVM_2M_PAGES (1u << HE_IVM_2M_ORDER)
+#define HE_DMA_MAP_MAX 64
 
 struct he_vm_add_page_req {
 	u64 vm_id;
@@ -69,11 +79,29 @@ struct he_ivm_exit {
 	u64 arg2;
 } __packed;
 
+struct he_dma_mapping {
+	u64 iova;
+	u64 paddr;
+	u64 size;
+} __packed;
+
+struct he_device_dma_map_req {
+	u16 bdf;
+	u16 reserved[3];
+	u64 handle;
+	u32 nr_maps;
+	u32 reserved2;
+	struct he_dma_mapping maps[HE_DMA_MAP_MAX];
+} __packed;
+
 struct he_ivm_page {
 	struct list_head link;
 	u64 vm_id;
 	u64 gpa;
 	struct page *page;
+	/* 1 for a pinned 4KB page, 512 for a kernel 2MB block. */
+	unsigned int nr;
+	bool kernel_block;
 };
 
 struct he_ivm_vcpu {
@@ -115,9 +143,26 @@ static struct he_ivm_page *he_ivm_find_page(struct he_ivm_file *f, u64 vm,
 static void he_ivm_drop_page(struct he_ivm_file *f, struct he_ivm_page *p)
 {
 	list_del(&p->link);
-	f->nr_pages--;
-	put_page(p->page);
+	if (f->nr_pages >= p->nr)
+		f->nr_pages -= p->nr;
+	else
+		f->nr_pages = 0;
+	if (p->kernel_block)
+		__free_pages(p->page, HE_IVM_2M_ORDER);
+	else
+		put_page(p->page);
 	kfree(p);
+}
+
+/* Bytes L1 can still read at the two ends of a donated 2MB block. */
+static void he_ivm_sample_2m(struct page *page, struct he_ivm_call *call)
+{
+	u8 *kaddr = page_address(page);
+
+	if (!kaddr)
+		return;
+	call->digest[0] = READ_ONCE(kaddr[0]);
+	call->digest[1] = READ_ONCE(kaddr[HE_IVM_2M - 1]);
 }
 
 static void he_ivm_drop_vm(struct he_ivm_file *f, u64 vm)
@@ -168,9 +213,86 @@ static int he_ivm_pin(struct he_ivm_file *f, u64 vm, u64 gpa, u64 uaddr,
 	p->vm_id = vm;
 	p->gpa = gpa;
 	p->page = page;
+	p->nr = 1;
 	list_add(&p->link, &f->pages);
 	f->nr_pages++;
 	*out = p;
+	return 0;
+}
+
+static int he_ivm_add_2m(struct he_ivm_file *f, struct he_ivm_call *call)
+{
+	struct page *page;
+	struct he_ivm_page *tracked;
+	struct he_vm_add_page_req *req;
+	u8 *kaddr;
+	unsigned long phys;
+
+	if (call->flags & ~HE_IVM_PAGE_KNOWN)
+		return -EINVAL;
+	if (call->user_addr || (call->gpa & (HE_IVM_2M - 1)))
+		return -EINVAL;
+	if (call->aux >= HE_IVM_2M)
+		return -EINVAL;
+	if (f->nr_pages > HE_IVM_MAX_PAGES - HE_IVM_2M_PAGES)
+		return -ENOMEM;
+	if (he_ivm_find_page(f, call->vm_id, call->gpa))
+		return -EEXIST;
+
+	page = alloc_pages(GFP_KERNEL | __GFP_COMP, HE_IVM_2M_ORDER);
+	if (!page)
+		return -ENOMEM;
+	kaddr = page_address(page);
+	phys = page_to_phys(page);
+	if (!kaddr || (phys & (HE_IVM_2M - 1)) ||
+	    (call->aux && !((phys + call->aux) & (HE_IVM_2M - 1)))) {
+		__free_pages(page, HE_IVM_2M_ORDER);
+		return -EINVAL;
+	}
+	kaddr[0] = 0xab;
+	kaddr[HE_IVM_2M - 1] = 0xcd;
+
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req) {
+		__free_pages(page, HE_IVM_2M_ORDER);
+		return -ENOMEM;
+	}
+	req->vm_id = call->vm_id;
+	req->gpa = call->gpa;
+	req->pfn = phys + call->aux;
+	req->flags = call->flags;
+	call->ret = hypercall_ret_1(HC_VM_ADD_PAGE, (unsigned long)req);
+	kfree(req);
+
+	/* aux forces a misaligned PFN. The monitor rejects it before
+	 * withdrawing, so the block is still ours to free.
+	 */
+	if (call->aux) {
+		if (!call->ret)
+			hypercall_ret_2(HC_VM_REMOVE_PAGE, call->vm_id,
+					call->gpa);
+		__free_pages(page, HE_IVM_2M_ORDER);
+		return 0;
+	}
+	if (call->ret) {
+		__free_pages(page, HE_IVM_2M_ORDER);
+		return 0;
+	}
+
+	he_ivm_sample_2m(page, call);
+	tracked = kzalloc(sizeof(*tracked), GFP_KERNEL);
+	if (!tracked) {
+		hypercall_ret_2(HC_VM_REMOVE_PAGE, call->vm_id, call->gpa);
+		__free_pages(page, HE_IVM_2M_ORDER);
+		return -ENOMEM;
+	}
+	tracked->vm_id = call->vm_id;
+	tracked->gpa = call->gpa;
+	tracked->page = page;
+	tracked->nr = HE_IVM_2M_PAGES;
+	tracked->kernel_block = true;
+	list_add(&tracked->link, &f->pages);
+	f->nr_pages += HE_IVM_2M_PAGES;
 	return 0;
 }
 
@@ -181,6 +303,11 @@ static int he_ivm_add(struct he_ivm_file *f, struct he_ivm_call *call,
 	struct he_vm_add_page_req *req;
 	int err;
 
+	if (call->flags & HE_IVM_PAGE_2M) {
+		if (shared)
+			return -EINVAL;
+		return he_ivm_add_2m(f, call);
+	}
 	if (shared) {
 		if (call->flags)
 			return -EINVAL;
@@ -231,6 +358,40 @@ static struct he_ivm_vcpu *he_ivm_find_vcpu(struct he_ivm_file *f, u64 vm,
 	return NULL;
 }
 
+static int he_ivm_dma(struct he_ivm_file *f, struct he_ivm_call *call)
+{
+	struct he_device_dma_map_req *req;
+
+	if (call->op != HC_DEVICE_MAP_DMA && call->op != HC_DEVICE_UNMAP_DMA)
+		return -EINVAL;
+	if (call->flags & ~HE_IVM_DMA_USE_GPA)
+		return -EINVAL;
+	if (!call->user_addr)
+		return -EINVAL;
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+	if (copy_from_user(req, (void __user *)(unsigned long)call->user_addr,
+			   sizeof(*req))) {
+		kfree(req);
+		return -EFAULT;
+	}
+	if (call->flags & HE_IVM_DMA_USE_GPA) {
+		struct he_ivm_page *p;
+
+		p = he_ivm_find_page(f, call->vm_id, call->gpa);
+		if (!p || p->kernel_block || !req->nr_maps ||
+		    req->nr_maps > HE_DMA_MAP_MAX) {
+			kfree(req);
+			return -EINVAL;
+		}
+		req->maps[0].paddr = page_to_phys(p->page);
+	}
+	call->ret = hypercall_ret_1(call->op, (unsigned long)req);
+	kfree(req);
+	return 0;
+}
+
 static int he_ivm_dispatch(struct he_ivm_file *f, struct he_ivm_call *call)
 {
 	switch (call->op) {
@@ -263,12 +424,13 @@ static int he_ivm_dispatch(struct he_ivm_file *f, struct he_ivm_call *call)
 	case HC_VM_REMOVE_PAGE: {
 		struct he_ivm_page *p;
 
+		p = he_ivm_find_page(f, call->vm_id, call->gpa);
 		call->ret = hypercall_ret_2(HC_VM_REMOVE_PAGE, call->vm_id,
 					    call->gpa);
-		if (!call->ret) {
-			p = he_ivm_find_page(f, call->vm_id, call->gpa);
-			if (p)
-				he_ivm_drop_page(f, p);
+		if (!call->ret && p) {
+			if (p->kernel_block)
+				he_ivm_sample_2m(p->page, call);
+			he_ivm_drop_page(f, p);
 		}
 		return 0;
 	}
@@ -375,6 +537,9 @@ static int he_ivm_dispatch(struct he_ivm_file *f, struct he_ivm_call *call)
 					    (unsigned long)&req);
 		return 0;
 	}
+	case HC_DEVICE_MAP_DMA:
+	case HC_DEVICE_UNMAP_DMA:
+		return he_ivm_dma(f, call);
 	case HC_VM_MEASURE: {
 		u8 *digest;
 
@@ -473,6 +638,8 @@ long he_ivm_ioctl(struct file *file, unsigned long arg)
 	BUILD_BUG_ON(sizeof(struct he_vcpu_timer_req) != 24);
 	BUILD_BUG_ON(sizeof(struct he_dev_map_bar_req) != 24);
 	BUILD_BUG_ON(sizeof(struct he_ivm_exit) != 40);
+	BUILD_BUG_ON(sizeof(struct he_device_dma_map_req) != 1560);
+	BUILD_BUG_ON(HE_IVM_2M != 2UL * 1024 * 1024);
 
 	if (!f)
 		return -EINVAL;
