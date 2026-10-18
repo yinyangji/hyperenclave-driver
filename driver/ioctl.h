@@ -132,4 +132,47 @@ struct he_encl_remove_pages {
 #define HE_IOC_ENCLAVE_REMOVE_PAGES \
 	_IOW(TEE_MAGIC, 0x22, struct he_encl_remove_pages)
 
+/*
+ * Isolated-VM hypercall, run from this driver so the monitor sees CPL 0.
+ * `op` is one of HC_VM_* / HC_DEV_* (0x60–0x6d). `ret` is the hypercall
+ * result: a positive vm id, 0, or a negative errno. Pages named by
+ * `user_addr` are pinned for the life of the donation. `flags` bit 0 is
+ * VM_PAGE_MEASURE; a 2MB span is rejected here (this ioctl pins 4KB).
+ * After VCPU_RUN, reason/request/arg0/arg1/arg2 are ExitInfo and `aux`
+ * is the exit GPA.
+ *
+ * Packed layout is 200 bytes. cloud-hypervisor/ivm_launch/he_ivm.h
+ * must match.
+ */
+struct he_ivm_call {
+	__u32 op;
+	__u32 idx;
+	__s64 ret;
+	__u64 vm_id;
+	__u64 gpa;
+	__u64 user_addr;
+	__u32 flags;
+	__u32 vector;
+	__u64 aux;
+	__u64 rip;
+	__u64 rsp;
+	__u64 cr3;
+	__u64 gdtr_base;
+	__u64 gdtr_limit;
+	__u64 idtr_base;
+	__u64 idtr_limit;
+	__u64 exit_gpa;
+	__u32 reason;
+	__u32 request;
+	__u64 arg0;
+	__u64 arg1;
+	__u64 arg2;
+	__u64 bdf;
+	__u32 bar;
+	__u32 _pad;
+	__u8 digest[32];
+} __packed;
+
+#define HE_IOC_IVM _IOWR(TEE_MAGIC, 0x30, struct he_ivm_call)
+
 #endif /* !_DRIVER_IOCTL_H */

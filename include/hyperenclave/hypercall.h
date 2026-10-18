@@ -214,6 +214,27 @@
  */
 #define HC_SET_INIT_CMRM_DONE 0x201
 
+/*
+ * Protected-device list and the isolated-VM hypercalls (monitor codes
+ * 0x50, 0x60–0x6d). Issued only from this driver; ring 3 reaches them
+ * through HE_IOC_IVM.
+ */
+#define HC_DEVICE_LIST 0x50
+#define HC_VM_CREATE 0x60
+#define HC_VM_DESTROY 0x61
+#define HC_VM_FINALIZE 0x62
+#define HC_VM_ADD_PAGE 0x63
+#define HC_VM_REMOVE_PAGE 0x64
+#define HC_VM_ADD_SHARED 0x65
+#define HC_VM_VCPU_CREATE 0x66
+#define HC_VM_VCPU_RUN 0x67
+#define HC_VM_VCPU_INJECT 0x68
+#define HC_VM_VCPU_SET_TIMER 0x69
+#define HC_DEV_ATTACH 0x6a
+#define HC_DEV_DETACH 0x6b
+#define HC_DEV_MAP_BAR 0x6c
+#define HC_VM_MEASURE 0x6d
+
 #include <asm/hyperenclave/hypercall.h>
 
 struct hc_encl_new_page_desc {

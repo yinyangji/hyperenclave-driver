@@ -27,20 +27,64 @@ static int __init check_ivrs_checksum(struct acpi_table_header *table)
 	return 0;
 }
 
+/*
+ * Record every IVHD of `want`. Type 0x10 and 0x11 share the prefix this
+ * function reads (type, length, mmio_phys); the walk advances by h->length
+ * so the shorter type 0x10 entry is not overrun. Returns 0, or a
+ * negative errno. The number of units is accumulated in `count`.
+ */
+static int append_ivhd(struct iommu_info *iommu_info, int *count, u8 want,
+		       u8 *p, u8 *end)
+{
+	while (p < end) {
+		struct ivhd_header *h = (struct ivhd_header *)p;
+		void *mmio_base;
+		u32 extended_feature;
+
+		if (p + 4 > end || h->length < 16 || p + h->length > end) {
+			he_err("IVHD entry overruns the IVRS table\n");
+			return -EINVAL;
+		}
+		if (h->type == want) {
+			if (*count >= HYPERENCLAVE_MAX_IOMMU_UNITS) {
+				he_err("too many IOMMU units\n");
+				return -ENOSPC;
+			}
+			iommu_info->iommu_units[*count].base = h->mmio_phys;
+			/*
+			 * AMD IOMMU spec, Capability Offset 04h: IOMMU Base
+			 * Address Low. MMIO offset 0x30 bit 9 selects
+			 * 512KB vs 16KB.
+			 */
+			mmio_base = ioremap(h->mmio_phys, SZ_4K);
+			if (!mmio_base) {
+				he_err("Fail to map iommu control registers\n");
+				return -ENOMEM;
+			}
+			extended_feature = readl(mmio_base + 0x30);
+			iounmap(mmio_base);
+			if (extended_feature & (1 << 9))
+				iommu_info->iommu_units[*count].size = SZ_512K;
+			else
+				iommu_info->iommu_units[*count].size = SZ_16K;
+			++*count;
+		}
+		p += h->length;
+	}
+	return 0;
+}
+
 bool parse_ivrs(struct iommu_info *iommu_info)
 {
-	int target_ivhd_type;
 	struct acpi_table_header *ivrs_base;
 	acpi_status status;
 	u8 *p, *end;
-	struct ivhd_header *h;
 	int count_iommu = 0;
 	int i;
 	bool ret = false;
 	const char *err;
-	void *mmio_base;
+	int rc;
 
-	target_ivhd_type = 0x11;
 	status = acpi_get_table("IVRS", 0, &ivrs_base);
 
 	if (status == AE_NOT_FOUND) {
@@ -60,47 +104,26 @@ bool parse_ivrs(struct iommu_info *iommu_info)
 	end = (u8 *)ivrs_base;
 	p += IVRS_HEADER_LENGTH;
 	end += ivrs_base->length;
-	while (p < end) {
-		h = (struct ivhd_header *)p;
-
-		/* Check. */
-		if (h->type == target_ivhd_type) {
-			iommu_info->iommu_units[count_iommu].base =
-				h->mmio_phys;
-
-			/*
-			 * Reference: AMD iommu spec, Capability Offset 04h:
-			 * IOMMU Base Address Low Register.
-			 * Use ioremap to access MMIO offset 0x30[PCsup(bit 9)]:
-			 * 1: 512KB(aligned) 0:16KB(aligned).
-			 */
-			mmio_base = ioremap(
-				h->mmio_phys, /* Pass MEM_MAP into it. */
-				SZ_4K);
-			/* Read and determine mmio size. */
-			if (!mmio_base) {
-				he_err("Fail to map iommu control registers\n");
-				goto out;
-			} else {
-				u32 extended_feature = readl(mmio_base + 0x30);
-
-				if (extended_feature & (1 << 9)) {
-					iommu_info->iommu_units[count_iommu]
-						.size = SZ_512K;
-				} else {
-					iommu_info->iommu_units[count_iommu]
-						.size = SZ_16K;
-				}
-			}
-			iounmap(mmio_base);
-
-			++count_iommu;
-		}
-		p += h->length;
+	/*
+	 * Prefer type 0x11. Real firmware publishes 0x10 and 0x11 for the
+	 * same IOMMU; recording both would register it twice. QEMU's
+	 * amd-iommu publishes type 0x10 only, so fall back when 0x11 is
+	 * absent.
+	 */
+	rc = append_ivhd(iommu_info, &count_iommu, 0x11, p, end);
+	if (rc)
+		goto out;
+	if (count_iommu == 0) {
+		rc = append_ivhd(iommu_info, &count_iommu, 0x10, p, end);
+		if (rc)
+			goto out;
+		if (count_iommu)
+			he_info("IVRS: using IVHD type 0x10 (%d unit(s))\n",
+				count_iommu);
 	}
 	for (i = count_iommu; i < HYPERENCLAVE_MAX_IOMMU_UNITS; ++i) {
-		iommu_info->iommu_units[count_iommu].base = 0;
-		iommu_info->iommu_units[count_iommu].size = 0;
+		iommu_info->iommu_units[i].base = 0;
+		iommu_info->iommu_units[i].size = 0;
 	}
 	ret = true;
 out:

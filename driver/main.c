@@ -59,6 +59,7 @@
 #include "mem_regions.h"
 #include "mem_test.h"
 #include "param_parser.h"
+#include "quarantine.h"
 #include "reclaim.h"
 #include "stats.h"
 #include "sysfs.h"
@@ -248,6 +249,12 @@ int he_cmd_enable(void)
 		}
 	}
 #endif
+
+	err = he_precheck_takeover();
+	if (err) {
+		he_err("takeover precheck failed: %d\n", err);
+		goto error_put_module;
+	}
 
 	/* Load hypervisor image */
 	err = request_firmware(&hypervisor, fw_name, hyperenclave_dev);
@@ -468,6 +475,17 @@ int he_cmd_enable(void)
 
 	enter_hv_cpus = atomic_read(&call_done);
 
+	err = he_reconcile_protected_devices();
+	if (err) {
+		int dis;
+
+		he_err("protected-device reconcile failed: %d\n", err);
+		dis = he_cmd_disable();
+		if (dis)
+			he_err("rollback disable failed: %d\n", dis);
+		return err;
+	}
+
 	he_info("The hyperenclave is opening.\n");
 	return 0;
 
@@ -650,6 +668,13 @@ static int __init he_init(void)
 		goto exit_reboot_notifier;
 	}
 
+	err = he_quarantine_register();
+	if (err) {
+		he_err("he-quarantine register failed: %d\n", err);
+		unregister_sysctl_table(hyper_enclave_table_header);
+		goto exit_reboot_notifier;
+	}
+
 	tdm.ops->proc_init();
 
 	return 0;
@@ -664,6 +689,7 @@ exit_reboot_notifier:
 static void __exit he_exit(void)
 {
 	unregister_reboot_notifier(&he_shutdown_nb);
+	he_quarantine_unregister();
 	misc_deregister(&he_misc_dev);
 	he_firmware_free();
 	unregister_sysctl_table(hyper_enclave_table_header);

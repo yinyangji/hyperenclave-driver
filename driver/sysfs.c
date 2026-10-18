@@ -18,6 +18,7 @@
 #include "enclave.h"
 #include "feature.h"
 #include "hhbox.h"
+#include "ivm.h"
 #include "reclaim.h"
 #include "sysfs.h"
 #include "tpm.h"
@@ -92,6 +93,9 @@ static long he_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 		break;
 	case HE_IOC_ENCLAVE_REMOVE_PAGES:
 		err = he_cmd_encl_remove_pages((void __user *)arg);
+		break;
+	case HE_IOC_IVM:
+		err = he_ivm_ioctl(file, arg);
 		break;
 	default:
 		err = -EINVAL;
@@ -208,6 +212,8 @@ static int he_mmap(struct file *file, struct vm_area_struct *vma)
 
 static const struct file_operations he_fops = {
 	.owner = THIS_MODULE,
+	.open = he_ivm_open,
+	.release = he_ivm_release,
 	.unlocked_ioctl = he_ioctl,
 	.compat_ioctl = he_ioctl,
 	.mmap = he_mmap,
